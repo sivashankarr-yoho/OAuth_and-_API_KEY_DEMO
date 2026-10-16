@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status, Security
+from fastapi import Depends, FastAPI, HTTPException, status, Security, Query, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 from fastapi.security import APIKeyHeader
 import os
 import secrets
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
 
 
 @asynccontextmanager
@@ -29,6 +33,15 @@ api_key_header = APIKeyHeader(
 )
 
 app = FastAPI(lifespan=lifespan)
+
+limiter = Limiter(key_func=get_remote_address)
+
+app.state.limiter = limiter
+
+app.add_exception_handler(
+    RateLimitExceeded,
+    _rate_limit_exceeded_handler
+)
 
 async def verify_api_key (api_key: str | None = Security(api_key_header)):
     if not API_KEY:
@@ -56,8 +69,10 @@ def create_employee(
             name=data.name,
             email=data.email,
             department_id=data.department_id,
-            employee_id="EMP_001",
-            address="Not specified",
+            employee_id=data.employee_id,
+            address=data.address,
+            salary=data.salary,
+            shift=data.shift    
         )
 
         db.add(employee)
@@ -70,13 +85,55 @@ def create_employee(
         db.rollback()
         raise
 
+@app.get("/employees/cursor")
+@limiter.limit("10/minute")
+def get_employees_cursor(
+    request: Request,
+    limit: int = Query(default=10, ge=1, le=100),
+    cursor: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_api_key),
+):
+    statement = select(Employee)
+
+    if cursor is not None:
+        statement = statement.where(Employee.id > cursor)
+
+    statement = (
+        statement
+        .order_by(Employee.id)
+        .limit(limit + 1)
+    )
+
+    employees = db.scalars(statement).all()
+
+    has_more = len(employees) > limit
+    data = employees[:limit]
+
+    next_cursor = (
+        data[-1].id if has_more and data else None
+    )
+
+    return {
+        "data": data,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }  
+
 
 @app.get(
     "/employees",
     response_model=list[EmployeeResponse],
 )
-def get_employees(db: Session = Depends(get_db)):
-    statement = select(Employee).order_by(Employee.id)
+def get_employees(
+    db: Session = Depends(get_db), 
+    limit: int = Query(default=10, ge=1, le=100), 
+    offset: int = Query(default=0, ge=0)
+    ):
+    statement = (
+        select(Employee).order_by(Employee.id).limit(limit).offset(offset)
+    )
+    
     return db.scalars(statement).all()
 
 
